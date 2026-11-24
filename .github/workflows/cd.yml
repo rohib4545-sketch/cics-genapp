@@ -1,5 +1,9 @@
 name: CD — deploy to GCP Cloud Run
 
+# contents:write lets the post-deploy job commit the functional test report back
+permissions:
+  contents: write
+
 # Runs only after CI completes successfully on main.
 on:
   workflow_run:
