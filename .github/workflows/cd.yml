@@ -1,0 +1,147 @@
+name: CD — deploy to GCP Cloud Run
+
+# Runs only after CI completes successfully on main.
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
+
+env:
+  GCP_REGION: us-central1
+  AR_REPO: genapp
+
+jobs:
+  deploy-backend:
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-latest
+    outputs:
+      backend-url: ${{ steps.deploy.outputs.backend-url }}
+      project-id: ${{ steps.auth.outputs.project_id }}
+      registry: ${{ steps.setup.outputs.registry }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: auth
+        name: Authenticate to GCP with service-account key from GitHub Secrets
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SECRET_KEY }}
+
+      - id: setup
+        name: Configure registry and Docker auth
+        shell: bash
+        run: |
+          REGISTRY=${{ env.GCP_REGION }}-docker.pkg.dev
+          echo "registry=$REGISTRY/${{ steps.auth.outputs.project_id }}/${{ env.AR_REPO }}" >> "$GITHUB_OUTPUT"
+      - run: gcloud auth configure-docker ${{ env.GCP_REGION }}-docker.pkg.dev --quiet
+      - id: repo
+        name: Ensure Artifact Registry repository exists
+        run: gcloud artifacts repositories create ${{ env.AR_REPO }} --repository-format=docker --location=${{ env.GCP_REGION }} || true
+
+      - name: Build and push backend image tagged with commit SHA
+        run: |
+          IMAGE=${{ steps.setup.outputs.registry }}/genapp-backend:${{ github.sha }}
+          docker build -t "$IMAGE" modernized/backend
+          docker push "$IMAGE"
+          echo "image=$IMAGE" >> "$GITHUB_ENV"
+
+      - id: deploy
+        name: Deploy backend to Cloud Run
+        run: |
+          gcloud run deploy genapp-backend \
+            --image ${{ steps.setup.outputs.registry }}/genapp-backend:${{ github.sha }} \
+            --region ${{ env.GCP_REGION }} --platform managed --allow-unauthenticated --port 8080
+          URL=$(gcloud run services describe genapp-backend --region ${{ env.GCP_REGION }} --format 'value(status.url)')
+          echo "backend-url=$URL" >> "$GITHUB_OUTPUT"
+          echo "Backend live at $URL"
+      - name: Smoke-check backend health
+        run: |
+          for i in 1 2 3 4 5; do
+            if curl -sf "${{ steps.deploy.outputs.backend-url }}/health" | grep -q UP; then exit 0; fi
+            sleep 10
+          done
+          exit 1
+
+  deploy-frontend:
+    needs: [deploy-backend]
+    runs-on: ubuntu-latest
+    outputs:
+      frontend-url: ${{ steps.deploy.outputs.frontend-url }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SECRET_KEY }}
+      - run: gcloud auth configure-docker ${{ env.GCP_REGION }}-docker.pkg.dev --quiet
+      - name: Build and push frontend image wired to the deployed backend
+        run: |
+          IMAGE=${{ needs.deploy-backend.outputs.registry }}/genapp-frontend:${{ github.sha }}
+          docker build --build-arg VITE_API_BASE=${{ needs.deploy-backend.outputs.backend-url }} -t "$IMAGE" modernized/frontend
+          docker push "$IMAGE"
+      - id: deploy
+        name: Deploy frontend to Cloud Run
+        run: |
+          gcloud run deploy genapp-frontend \
+            --image ${{ needs.deploy-backend.outputs.registry }}/genapp-frontend:${{ github.sha }} \
+            --region ${{ env.GCP_REGION }} --platform managed --allow-unauthenticated --port 8080
+          echo "frontend-url=$(gcloud run services describe genapp-frontend --region ${{ env.GCP_REGION }} --format 'value(status.url)')" >> "$GITHUB_OUTPUT"
+      - name: Smoke-check frontend is reachable
+        run: curl -sf "${{ steps.deploy.outputs.frontend-url }}" | grep -qi haven
+
+  post-deploy-tests:
+    name: Post-deployment functional testing against the live application
+    needs: [deploy-backend, deploy-frontend]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run functional test suite against the live backend
+        id: tests
+        run: |
+          set +e
+          BASE_URL=${{ needs.deploy-backend.outputs.backend-url }} \
+            bash modernized/tests/functional_tests.sh | tee functional-results.txt
+          STATUS=${PIPESTATUS[0]}
+          echo "exit=$STATUS" >> "$GITHUB_OUTPUT"
+      - name: Live frontend check
+        run: curl -sf "${{ needs.deploy-frontend.outputs.frontend-url }}" -o /dev/null && echo "frontend reachable"
+      - name: Generate report
+        if: always()
+        run: |
+          mkdir -p modernized/tests/reports
+          TOTAL=$(grep -c '^ok\|^FAIL' functional-results.txt || true)
+          PASSED=$(grep -c '^ok' functional-results.txt || true)
+          FAILED=$(grep -c '^FAIL' functional-results.txt || true)
+          PCT=$(awk "BEGIN { print ($TOTAL>0) ? int(100*$PASSED/$TOTAL) : 0 }")
+          {
+            echo "# Post-deployment functional test report"
+            echo "- Commit: ${{ github.sha }}"
+            echo "- Timestamp: $(date -u +%FT%TZ)"
+            echo "- Backend: ${{ needs.deploy-backend.outputs.backend-url }}"
+            echo "- Frontend: ${{ needs.deploy-frontend.outputs.frontend-url }}"
+            echo "- Total: $TOTAL — passed: $PASSED — failed: $FAILED — skipped: 0"
+            echo "- Pass rate: ${PCT}%"
+            echo
+            echo '```'
+            cat functional-results.txt
+            echo '```'
+          } > modernized/tests/reports/functional-report-${{ github.sha }}.md
+          cp modernized/tests/reports/functional-report-${{ github.sha }}.md modernized/tests/reports/latest.md
+          echo "### Functional tests: $PASSED/$TOTAL passed (${PCT}%) against live Cloud Run deployment" >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload report artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: functional-test-report
+          path: modernized/tests/reports/
+      - name: Commit report back to the repository
+        if: always()
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add modernized/tests/reports/
+          git commit -m "Post-deployment functional test report for ${{ github.sha }} [skip ci]" || echo "nothing to commit"
+          git push
+      - name: Fail pipeline if functional tests failed
+        if: steps.tests.outputs.exit != '0'
+        run: exit 1
